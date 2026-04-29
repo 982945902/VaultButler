@@ -1,0 +1,26 @@
+{
+  "name": "obsidian-vault-butler",
+  "version": "0.1.0",
+  "description": "AI-assisted Obsidian vault organizer plugin.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+  },
+  "keywords": [
+    "obsidian",
+    "plugin",
+    "ai",
+    "llm",
+    "knowledge-base"
+  ],
+  "author": "ChatGPT",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.21.5",
+    "obsidian": "^1.5.12",
+    "typescript": "^5.4.5"
+  }
+}
