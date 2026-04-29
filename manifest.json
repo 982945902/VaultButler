@@ -1,0 +1,10 @@
+{
+  "id": "vault-butler",
+  "name": "Vault Butler",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "AI-assisted Obsidian vault organizer: ingest raw notes into a structured LLM wiki.",
+  "author": "ChatGPT",
+  "authorUrl": "https://chat.openai.com",
+  "isDesktopOnly": false
+}
