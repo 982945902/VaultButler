@@ -1,6 +1,5 @@
 import {
   App,
-  MarkdownView,
   Notice,
   Plugin,
   PluginSettingTab,
@@ -18,9 +17,7 @@ interface VaultButlerSettings {
   rawFolder: string;
   wikiFolder: string;
   indexFile: string;
-  logFile: string;
   agentsFile: string;
-  previewMode: boolean;
   maxRawFilesPerRun: number;
 }
 
@@ -34,6 +31,25 @@ interface LlmWikiResponse {
   files?: WikiFile[];
 }
 
+interface SourceState {
+  mtime: number;
+  size: number;
+  syncedAt: string;
+  writtenFiles: string[];
+}
+
+interface VaultButlerState {
+  version: number;
+  sources: Record<string, SourceState>;
+}
+
+interface RawSource {
+  path: string;
+  content: string;
+  mtime: number;
+  size: number;
+}
+
 const DEFAULT_SETTINGS: VaultButlerSettings = {
   apiBaseUrl: "https://api.openai.com/v1",
   apiKey: "",
@@ -41,11 +57,13 @@ const DEFAULT_SETTINGS: VaultButlerSettings = {
   rawFolder: "raw",
   wikiFolder: "wiki",
   indexFile: "index.md",
-  logFile: "log.md",
   agentsFile: "AGENTS.md",
-  previewMode: true,
   maxRawFilesPerRun: 20,
 };
+
+const HIDDEN_FOLDER = ".vault-butler";
+const LOG_FILE = `${HIDDEN_FOLDER}/log.md`;
+const STATE_FILE = `${HIDDEN_FOLDER}/state.json`;
 
 const AGENTS_TEMPLATE = `# Vault Butler Rules
 
@@ -56,7 +74,8 @@ You maintain this Obsidian vault as a Markdown wiki.
 - \`raw/\` contains immutable source notes. Never edit or rewrite raw files.
 - \`wiki/\` contains synthesized wiki pages.
 - \`index.md\` is the navigation map.
-- \`log.md\` is an append-only maintenance log.
+- \`.vault-butler/log.md\` is the hidden maintenance log.
+- \`.vault-butler/state.json\` tracks incremental sync state.
 
 ## Writing Rules
 
@@ -65,6 +84,7 @@ You maintain this Obsidian vault as a Markdown wiki.
 - Prefer updating existing pages over creating duplicates.
 - Keep claims grounded in the source material.
 - Use concise Markdown with clear headings.
+- Each generated page should include a source section with the raw note path and latest raw update time.
 
 ## Suggested Wiki Areas
 
@@ -73,7 +93,6 @@ You maintain this Obsidian vault as a Markdown wiki.
 - \`wiki/workflows/\`
 - \`wiki/sources/\`
 - \`wiki/decisions/\`
-- \`wiki/drafts/\`
 `;
 
 export default class VaultButlerPlugin extends Plugin {
@@ -82,22 +101,14 @@ export default class VaultButlerPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
 
-    this.addCommand({
-      id: "create-agents-template",
-      name: "Create AGENTS.md template",
-      callback: () => this.runSafely(() => this.createAgentsTemplate()),
+    this.addRibbonIcon("refresh-cw", "Vault Butler: Update wiki", () => {
+      void this.runSafely(() => this.updateWikiFromRawChanges());
     });
 
     this.addCommand({
-      id: "ingest-current-note",
-      name: "Ingest current note into wiki",
-      callback: () => this.runSafely(() => this.ingestCurrentNote()),
-    });
-
-    this.addCommand({
-      id: "organize-raw-folder",
-      name: "Organize raw folder into wiki",
-      callback: () => this.runSafely(() => this.organizeRawFolder()),
+      id: "update-wiki-from-raw-changes",
+      name: "Update wiki from raw changes",
+      callback: () => this.runSafely(() => this.updateWikiFromRawChanges()),
     });
 
     this.addCommand({
@@ -107,19 +118,9 @@ export default class VaultButlerPlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "apply-current-preview",
-      name: "Apply current preview to wiki",
-      callback: () => this.runSafely(() => this.applyCurrentPreview()),
-    });
-
-    this.addCommand({
-      id: "toggle-preview-mode",
-      name: "Toggle preview mode",
-      callback: () => this.runSafely(async () => {
-        this.settings.previewMode = !this.settings.previewMode;
-        await this.saveSettings();
-        new Notice(`Vault Butler preview mode ${this.settings.previewMode ? "enabled" : "disabled"}.`);
-      }),
+      id: "create-agents-template",
+      name: "Create AGENTS.md template",
+      callback: () => this.runSafely(() => this.createAgentsTemplate()),
     });
 
     this.addSettingTab(new VaultButlerSettingTab(this.app, this));
@@ -130,7 +131,6 @@ export default class VaultButlerPlugin extends Plugin {
     this.settings.rawFolder = cleanPath(this.settings.rawFolder);
     this.settings.wikiFolder = cleanPath(this.settings.wikiFolder);
     this.settings.indexFile = cleanPath(this.settings.indexFile);
-    this.settings.logFile = cleanPath(this.settings.logFile);
     this.settings.agentsFile = cleanPath(this.settings.agentsFile);
   }
 
@@ -143,7 +143,8 @@ export default class VaultButlerPlugin extends Plugin {
       await work();
     } catch (error) {
       console.error("Vault Butler error", error);
-      new Notice(`Vault Butler error: ${errorMessage(error)}`);
+      new Notice(`Vault Butler error: ${errorMessage(error)}`, 12000);
+      await this.appendLog(`Error: ${errorMessage(error)}`);
     }
   }
 
@@ -154,129 +155,96 @@ export default class VaultButlerPlugin extends Plugin {
       return;
     }
 
-    await this.ensureParentFolder(path);
     await this.upsertFile(path, AGENTS_TEMPLATE);
     new Notice(`Vault Butler wrote ${path}.`);
   }
 
-  async applyCurrentPreview() {
-    const active = this.app.workspace.getActiveViewOfType(MarkdownView);
-    const file = active?.file;
-    if (!file) {
-      new Notice("Open a Vault Butler preview file first.");
-      return;
-    }
-
-    const draftsPrefix = `${this.settings.wikiFolder}/drafts/`;
-    if (!cleanPath(file.path).startsWith(draftsPrefix)) {
-      new Notice(`Open a preview file under ${draftsPrefix} first.`);
-      return;
-    }
-
-    const content = await this.app.vault.read(file);
-    const proposedFiles = parsePreviewFiles(content);
-    if (proposedFiles.length === 0) {
-      new Notice("No proposed wiki files found in this preview.");
-      return;
-    }
-
-    let count = 0;
-    for (const proposed of proposedFiles) {
-      await this.safeWriteWikiFile(proposed.path, proposed.content);
-      count += 1;
-    }
-
-    await this.rebuildIndex(false);
-    await this.appendLog(`Applied preview [[${file.path}]]; wrote ${count} wiki file(s).`);
-    new Notice(`Applied ${count} wiki file(s) from preview.`);
-  }
-
-  async ingestCurrentNote() {
-    const active = this.app.workspace.getActiveViewOfType(MarkdownView);
-    const file = active?.file;
-    if (!file) {
-      new Notice("Open a Markdown note before ingesting.");
-      return;
-    }
-
-    if (!this.isInRawFolder(file.path)) {
-      new Notice(`Vault Butler only ingests files from ${this.settings.rawFolder}/.`);
-      return;
-    }
-
-    const content = await this.app.vault.read(file);
-    new Notice(`Vault Butler ingesting ${file.path}...`, 6000);
-    await this.ingestSources([{ path: file.path, content }], "current note");
-  }
-
-  async organizeRawFolder() {
-    const rawFolder = this.app.vault.getAbstractFileByPath(this.settings.rawFolder);
-    if (!(rawFolder instanceof TFolder)) {
-      new Notice(`Raw folder not found: ${this.settings.rawFolder}`);
-      return;
-    }
-
-    const files = this.collectMarkdownFiles(rawFolder).slice(0, this.settings.maxRawFilesPerRun);
-    if (files.length === 0) {
-      new Notice(`No Markdown files found under ${this.settings.rawFolder}/.`);
-      return;
-    }
-
-    const sources = await Promise.all(
-      files.map(async (file) => ({
-        path: file.path,
-        content: await this.app.vault.read(file),
-      })),
-    );
-
-    await this.ingestSources(sources, `${files.length} raw files`);
-  }
-
-  async ingestSources(sources: Array<{ path: string; content: string }>, label: string) {
+  async updateWikiFromRawChanges() {
     if (!this.settings.apiKey.trim()) {
       new Notice("Set an API key in Vault Butler settings first.");
       return;
     }
 
-    new Notice(`Vault Butler is organizing ${label}...`);
+    const changedSources = await this.collectChangedRawSources();
+    if (changedSources.length === 0) {
+      new Notice("Vault Butler: wiki is already up to date.");
+      await this.appendLog("No raw changes detected.");
+      return;
+    }
+
+    new Notice(`Vault Butler syncing ${changedSources.length} changed raw file(s)...`, 8000);
     const existingWiki = await this.readExistingWikiSummary();
     const agents = await this.readOptionalFile(this.settings.agentsFile);
-    const response = await this.requestWikiPlan(sources, existingWiki, agents);
+    const response = await this.requestWikiPlan(changedSources, existingWiki, agents);
 
     if (!response.files || response.files.length === 0) {
       new Notice("The model did not return any wiki files.");
-      await this.appendLog(`No wiki files returned for ${label}.`);
+      await this.appendLog(`No wiki files returned for ${changedSources.length} changed raw file(s).`);
       return;
     }
 
-    if (this.settings.previewMode) {
-      const previewPath = this.makePreviewPath();
-      const previewBody = this.renderPreview(response, sources);
-      await this.safeWriteWikiFile(previewPath, previewBody);
-      await this.appendLog(`Preview created for ${label}: [[${previewPath}]]`);
-      new Notice(`Preview written to ${previewPath}.`);
-      return;
-    }
-
-    let count = 0;
+    let writtenCount = 0;
     for (const file of response.files) {
       await this.safeWriteWikiFile(file.path, file.content);
-      count += 1;
+      writtenCount += 1;
     }
 
+    await this.recordSyncedSources(changedSources, response.files);
     await this.rebuildIndex(false);
-    await this.appendLog(`Ingested ${label}; wrote ${count} wiki file(s).`);
-    new Notice(`Vault Butler wrote ${count} wiki file(s).`);
+    await this.appendLog(
+      `Synced ${changedSources.length} raw file(s); wrote ${writtenCount} wiki file(s). Latest raw update: ${latestMtimeIso(changedSources)}. Sources: ${changedSources.map((source) => source.path).join(", ")}`,
+    );
+    new Notice(`Vault Butler synced ${changedSources.length} raw file(s), wrote ${writtenCount} wiki file(s).`);
   }
 
-  async requestWikiPlan(
-    sources: Array<{ path: string; content: string }>,
-    existingWiki: string,
-    agents: string,
-  ): Promise<LlmWikiResponse> {
+  async collectChangedRawSources(): Promise<RawSource[]> {
+    const rawFolder = this.app.vault.getAbstractFileByPath(this.settings.rawFolder);
+    if (!(rawFolder instanceof TFolder)) {
+      throw new Error(`Raw folder not found: ${this.settings.rawFolder}`);
+    }
+
+    const state = await this.readState();
+    const files = this.collectMarkdownFiles(rawFolder);
+    const changed = files.filter((file) => {
+      const previous = state.sources[file.path];
+      return !previous || previous.mtime !== file.stat.mtime || previous.size !== file.stat.size;
+    });
+
+    const limited = changed.slice(0, this.settings.maxRawFilesPerRun);
+    return Promise.all(
+      limited.map(async (file) => ({
+        path: file.path,
+        content: await this.app.vault.read(file),
+        mtime: file.stat.mtime,
+        size: file.stat.size,
+      })),
+    );
+  }
+
+  async recordSyncedSources(sources: RawSource[], writtenFiles: WikiFile[]) {
+    const state = await this.readState();
+    const syncedAt = new Date().toISOString();
+    const writtenPaths = writtenFiles.map((file) => cleanPath(file.path));
+
+    for (const source of sources) {
+      state.sources[source.path] = {
+        mtime: source.mtime,
+        size: source.size,
+        syncedAt,
+        writtenFiles: writtenPaths,
+      };
+    }
+
+    await this.writeState(state);
+  }
+
+  async requestWikiPlan(sources: RawSource[], existingWiki: string, agents: string): Promise<LlmWikiResponse> {
     const url = `${this.settings.apiBaseUrl.replace(/\/+$/, "")}/chat/completions`;
     const sourceText = sources
-      .map((source) => `SOURCE: ${source.path}\n\n${source.content}`)
+      .map(
+        (source) =>
+          `SOURCE: ${source.path}\nLATEST_RAW_UPDATE: ${new Date(source.mtime).toISOString()}\nSIZE_BYTES: ${source.size}\n\n${source.content}`,
+      )
       .join("\n\n---\n\n");
 
     const messages = [
@@ -294,14 +262,16 @@ Existing wiki inventory:
 ${existingWiki || "(none)"}
 
 Task:
-Convert the source notes into durable wiki pages.
+Incrementally update the Markdown wiki from the changed raw source notes.
 
 Constraints:
 - Return JSON shaped as {"summary":"...","files":[{"path":"wiki/...md","content":"..."}]}.
 - Every file path must be inside ${this.settings.wikiFolder}/ and end in .md.
+- Return the full desired content for each file. Existing files may be overwritten.
+- Prefer updating existing related wiki pages over creating duplicates.
 - Use Obsidian links where useful.
-- Include source references in the content.
-- Do not write index.md, log.md, AGENTS.md, raw files, or arbitrary paths.
+- Include source references and latest raw update time in each generated page.
+- Do not write index.md, AGENTS.md, hidden files, raw files, or arbitrary paths.
 
 ${sourceText}`,
       },
@@ -367,7 +337,7 @@ ${sourceText}`,
       }
     }
 
-    await this.safeWriteSpecialFile(this.settings.indexFile, lines.join("\n").trimEnd() + "\n");
+    await this.safeWriteIndexFile(lines.join("\n").trimEnd() + "\n");
     await this.appendLog(`Rebuilt ${this.settings.indexFile} with ${files.length} wiki page(s).`);
     if (showNotice) {
       new Notice(`Vault Butler rebuilt ${this.settings.indexFile}.`);
@@ -395,7 +365,7 @@ ${sourceText}`,
   }
 
   async readExistingWikiSummary(): Promise<string> {
-    const files = this.collectWikiMarkdownFiles().slice(0, 80);
+    const files = this.collectWikiMarkdownFiles().slice(0, 120);
     return files.map((file) => `- ${file.path}`).join("\n");
   }
 
@@ -407,36 +377,6 @@ ${sourceText}`,
     return "";
   }
 
-  renderPreview(response: LlmWikiResponse, sources: Array<{ path: string }>): string {
-    const lines = [
-      "# Vault Butler Preview",
-      "",
-      `Created: ${new Date().toISOString()}`,
-      "",
-      "## Sources",
-      "",
-      ...sources.map((source) => `- [[${source.path.replace(/\.md$/, "")}|${source.path}]]`),
-      "",
-      "## Summary",
-      "",
-      response.summary || "(No summary returned.)",
-      "",
-      "## Proposed Files",
-      "",
-    ];
-
-    for (const file of response.files ?? []) {
-      lines.push(`### ${file.path}`, "", "```markdown", file.content.trimEnd(), "```", "");
-    }
-
-    return lines.join("\n");
-  }
-
-  makePreviewPath(): string {
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    return normalizePath(`${this.settings.wikiFolder}/drafts/vault-butler-preview-${stamp}.md`);
-  }
-
   async safeWriteWikiFile(path: string, content: string) {
     const clean = cleanPath(path);
     if (!this.isAllowedWikiPath(clean)) {
@@ -445,24 +385,39 @@ ${sourceText}`,
     await this.upsertFile(clean, content.trimEnd() + "\n");
   }
 
-  async safeWriteSpecialFile(path: string, content: string) {
-    const clean = cleanPath(path);
-    const allowed = [this.settings.indexFile, this.settings.logFile].map(cleanPath);
-    if (!allowed.includes(clean) || !isRootMarkdownFile(clean)) {
-      throw new Error(`Refusing to write special file: ${path}`);
+  async safeWriteIndexFile(content: string) {
+    const clean = cleanPath(this.settings.indexFile);
+    if (!isRootMarkdownFile(clean)) {
+      throw new Error(`Index file must be a root-level Markdown file: ${clean}`);
     }
     await this.upsertFile(clean, content);
   }
 
   async appendLog(message: string) {
-    const path = cleanPath(this.settings.logFile);
-    if (!isRootMarkdownFile(path)) {
-      throw new Error("Log file must be a root-level Markdown file.");
+    const line = `- ${new Date().toISOString()} - ${message}\n`;
+    const existing = await this.readOptionalFile(LOG_FILE);
+    await this.upsertFile(LOG_FILE, existing ? existing.trimEnd() + "\n" + line : "# Vault Butler Log\n\n" + line);
+  }
+
+  async readState(): Promise<VaultButlerState> {
+    const text = await this.readOptionalFile(STATE_FILE);
+    if (!text.trim()) {
+      return { version: 1, sources: {} };
     }
 
-    const line = `- ${new Date().toISOString()} - ${message}\n`;
-    const existing = await this.readOptionalFile(path);
-    await this.safeWriteSpecialFile(path, existing ? existing.trimEnd() + "\n" + line : "# Vault Butler Log\n\n" + line);
+    try {
+      const state = JSON.parse(text) as VaultButlerState;
+      return {
+        version: state.version || 1,
+        sources: state.sources || {},
+      };
+    } catch {
+      return { version: 1, sources: {} };
+    }
+  }
+
+  async writeState(state: VaultButlerState) {
+    await this.upsertFile(STATE_FILE, JSON.stringify(state, null, 2) + "\n");
   }
 
   async upsertFile(path: string, content: string) {
@@ -479,7 +434,7 @@ ${sourceText}`,
   }
 
   async ensureParentFolder(path: string) {
-    const parts = path.split("/");
+    const parts = cleanPath(path).split("/");
     parts.pop();
     if (parts.length === 0) {
       return;
@@ -497,19 +452,14 @@ ${sourceText}`,
     }
   }
 
-  isInRawFolder(path: string): boolean {
-    const raw = `${this.settings.rawFolder}/`;
-    return cleanPath(path).startsWith(raw);
-  }
-
   isAllowedWikiPath(path: string): boolean {
     const clean = cleanPath(path);
     const wiki = `${this.settings.wikiFolder}/`;
-    return clean.startsWith(wiki) && clean.endsWith(".md") && !clean.includes("../");
+    return clean.startsWith(wiki) && clean.endsWith(".md") && !clean.includes("../") && !clean.startsWith(`${wiki}drafts/`);
   }
 }
 
-type PathSettingKey = "rawFolder" | "wikiFolder" | "indexFile" | "logFile" | "agentsFile";
+type PathSettingKey = "rawFolder" | "wikiFolder" | "indexFile" | "agentsFile";
 
 class VaultButlerSettingTab extends PluginSettingTab {
   plugin: VaultButlerPlugin;
@@ -563,24 +513,13 @@ class VaultButlerSettingTab extends PluginSettingTab {
       );
 
     this.addPathSetting("Raw folder", "Source notes. Vault Butler never writes here.", "rawFolder");
-    this.addPathSetting("Wiki folder", "AI-synthesized pages are written here.", "wikiFolder");
+    this.addPathSetting("Wiki folder", "AI-synthesized pages are written here and may be overwritten.", "wikiFolder");
     this.addPathSetting("Index file", "Root-level Markdown navigation file.", "indexFile");
-    this.addPathSetting("Log file", "Root-level append-only maintenance log.", "logFile");
     this.addPathSetting("AGENTS file", "Root-level Markdown rules file.", "agentsFile");
 
     new Setting(containerEl)
-      .setName("Preview mode")
-      .setDesc("When enabled, LLM output is written to wiki/drafts as a preview instead of real wiki pages.")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.previewMode).onChange(async (value) => {
-          this.plugin.settings.previewMode = value;
-          await this.plugin.saveSettings();
-        }),
-      );
-
-    new Setting(containerEl)
       .setName("Max raw files per run")
-      .setDesc("Caps the Organize raw folder command to keep requests manageable.")
+      .setDesc("Caps the one-click update command to keep requests manageable.")
       .addText((text) =>
         text.setValue(String(this.plugin.settings.maxRawFilesPerRun)).onChange(async (value) => {
           const parsed = Number.parseInt(value, 10);
@@ -588,6 +527,10 @@ class VaultButlerSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }),
       );
+
+    new Setting(containerEl)
+      .setName("Hidden log and state")
+      .setDesc(`Vault Butler writes maintenance files to ${LOG_FILE} and ${STATE_FILE}.`);
   }
 
   addPathSetting(name: string, desc: string, key: PathSettingKey) {
@@ -619,19 +562,8 @@ function titleCase(value: string): string {
     .join(" ");
 }
 
-function parsePreviewFiles(content: string): WikiFile[] {
-  const files: WikiFile[] = [];
-  const pattern = /^### (.+\.md)\n+```markdown\n([\s\S]*?)\n```/gm;
-  let match: RegExpExecArray | null;
-
-  while ((match = pattern.exec(content)) !== null) {
-    files.push({
-      path: cleanPath(match[1]),
-      content: match[2].trimEnd() + "\n",
-    });
-  }
-
-  return files;
+function latestMtimeIso(sources: RawSource[]): string {
+  return new Date(Math.max(...sources.map((source) => source.mtime))).toISOString();
 }
 
 function errorMessage(error: unknown): string {

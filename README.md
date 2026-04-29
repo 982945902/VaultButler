@@ -8,8 +8,10 @@ It is designed for this workflow:
 raw/       = immutable source notes
 wiki/      = AI-synthesized knowledge base
 index.md   = navigation map
-log.md     = append-only maintenance log
 AGENTS.md  = rules for the AI organizer
+.vault-butler/
+  log.md     = hidden append-only maintenance log
+  state.json = hidden incremental sync state
 ```
 
 ## What it does
@@ -17,16 +19,16 @@ AGENTS.md  = rules for the AI organizer
 Commands:
 
 - **Vault Butler: Create AGENTS.md template**
-- **Vault Butler: Ingest current note into wiki**
-- **Vault Butler: Organize raw folder into wiki**
+- **Vault Butler: Update wiki from raw changes**
 - **Vault Butler: Rebuild wiki index locally**
-- **Vault Butler: Toggle preview mode**
+
+The left ribbon button runs **Update wiki from raw changes**.
 
 The AI writes only to:
 
 - your configured `wiki/` folder
 - your configured `index.md`
-- your configured `log.md`
+- the hidden `.vault-butler/` maintenance folder
 
 It refuses to write to `raw/` or arbitrary paths.
 
@@ -65,10 +67,12 @@ Configure:
 - Raw folder: `raw`
 - Wiki folder: `wiki`
 - Index file: `index.md`
-- Log file: `log.md`
 - AGENTS file: `AGENTS.md`
+- Max raw files per run: `20`
 
 The plugin uses the OpenAI-compatible `/chat/completions` API.
+
+The sync is incremental: Vault Butler records each raw file's latest modified time and size in `.vault-butler/state.json`, then only sends changed or new raw Markdown files on the next update.
 
 ## Recommended vault layout
 
@@ -76,7 +80,10 @@ The plugin uses the OpenAI-compatible `/chat/completions` API.
 vault/
   AGENTS.md
   index.md
-  log.md
+
+  .vault-butler/
+    log.md
+    state.json
 
   raw/
     slack/
@@ -90,27 +97,23 @@ vault/
     workflows/
     sources/
     decisions/
-    drafts/
 ```
 
-## Safe usage
+## Usage
 
-Start with **Preview mode enabled**.
-
-In preview mode, the plugin writes one preview file under:
+Put source notes under `raw/`, then click the Vault Butler ribbon button or run:
 
 ```text
-wiki/drafts/
+Vault Butler: Update wiki from raw changes
 ```
 
-It will not modify your real wiki pages until you disable preview mode.
+The plugin directly trusts the LLM output and writes the returned files to `wiki/`. Existing wiki files with the same paths are overwritten. Each run updates `index.md`, appends `.vault-butler/log.md`, and records sync state in `.vault-butler/state.json`.
 
 ## Notes
 
 This is an MVP. Good next steps:
 
-- add a side panel to approve file-by-file changes
 - support local Ollama/LM Studio models
 - add embeddings and semantic deduplication
 - add Linear/GitHub issue export
-- add automatic source fingerprinting so the same raw file is not ingested twice
+- add content hashing in addition to modified-time based incremental sync
