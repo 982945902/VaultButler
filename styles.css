@@ -1,0 +1,9 @@
+.vault-butler-settings input[type="text"],
+.vault-butler-settings input[type="password"],
+.vault-butler-settings textarea {
+  width: 100%;
+}
+
+.vault-butler-settings .setting-item-description code {
+  font-size: 0.9em;
+}
