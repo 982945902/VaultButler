@@ -1,43 +1,61 @@
 # Vault Butler
 
-An MVP Obsidian plugin that turns your vault into an **LLM-maintained Markdown wiki**.
+An MVP Obsidian plugin that digests temporary notes into an **LLM-maintained Markdown wiki**.
 
 It is designed for this workflow:
 
 ```text
-raw/       = immutable source notes
-wiki/      = AI-synthesized knowledge base
-index.md   = navigation map
-AGENTS.md  = rules for the AI organizer
+temporary notes anywhere outside wiki/ = input material
+wiki/                                  = AI-synthesized knowledge base
+index.md                               = navigation map
+AGENTS.md                              = rules for the AI organizer
 .vault-butler/
-  log.md     = hidden append-only maintenance log
-  state.json = hidden incremental sync state
+  log.md                               = hidden maintenance log
+  state.json                           = hidden plugin run state
 ```
 
 ## What it does
 
 Commands:
 
-- **Vault Butler: Create AGENTS.md template**
-- **Vault Butler: Update wiki from raw changes**
+- **Vault Butler: Digest source notes into wiki**
+- **Vault Butler: Force update all source notes**
 - **Vault Butler: Rebuild wiki index locally**
+- **Vault Butler: Create AGENTS.md template**
 
-The left ribbon button runs **Update wiki from raw changes**.
+The left ribbon button runs **Digest source notes into wiki**.
 
-The AI writes only to:
+The plugin scans Markdown notes outside:
 
-- your configured `wiki/` folder
-- your configured `index.md`
-- the hidden `.vault-butler/` maintenance folder
+- `wiki/`
+- `.vault-butler/`
+- `.obsidian/`
+- `index.md`
+- `AGENTS.md`
 
-It refuses to write to `raw/` or arbitrary paths.
+It sends those notes to the LLM, writes the returned pages to `wiki/`, rebuilds `index.md`, and deletes the source notes after a successful run.
+
+## Usage
+
+Write temporary notes anywhere outside `wiki/`, `.vault-butler/`, and `.obsidian/`.
+
+Then run:
+
+```text
+Vault Butler: Digest source notes into wiki
+```
+
+or click the Vault Butler ribbon button.
+
+The command is intentionally destructive: once the LLM successfully returns wiki files and those files are written, the source notes used in that run are deleted.
+
+To keep a note permanently, move it under `wiki/` or make it part of `AGENTS.md` / `index.md`.
 
 ## Install for development
 
 ```bash
-cd obsidian-vault-butler
-npm install
-npm run build
+bun install
+bun run build
 ```
 
 Then copy these files into your vault:
@@ -56,7 +74,7 @@ Restart Obsidian and enable **Vault Butler** in Community Plugins.
 Open:
 
 ```text
-Settings → Community plugins → Vault Butler
+Settings -> Community plugins -> Vault Butler
 ```
 
 Configure:
@@ -64,56 +82,54 @@ Configure:
 - API base URL: `https://api.openai.com/v1`
 - API key: your OpenAI-compatible key
 - Model: e.g. `gpt-4.1-mini`, `gpt-4o-mini`, or your OpenAI-compatible model
-- Raw folder: `raw`
 - Wiki folder: `wiki`
 - Index file: `index.md`
 - AGENTS file: `AGENTS.md`
-- Max raw files per run: `20`
+- Max source files per run: `20`
 
 The plugin uses the OpenAI-compatible `/chat/completions` API.
 
-The sync is incremental: Vault Butler records each raw file's latest modified time and size in `.vault-butler/state.json`, then only sends changed or new raw Markdown files on the next update.
-
-## Recommended vault layout
+## Recommended Vault Layout
 
 ```text
 vault/
   AGENTS.md
   index.md
 
-  .vault-butler/
-    log.md
-    state.json
-
-  raw/
-    slack/
-    linear/
-    papers/
-    meeting-notes/
+  inbox.md
+  scratch/
+    temporary-note.md
 
   wiki/
     concepts/
     projects/
     workflows/
+    examples/
     sources/
     decisions/
+
+  .vault-butler/
+    log.md
+    state.json
 ```
 
-## Usage
+## Destructive Behavior
 
-Put source notes under `raw/`, then click the Vault Butler ribbon button or run:
+Vault Butler treats source notes as disposable input.
 
-```text
-Vault Butler: Update wiki from raw changes
-```
+Files that can be deleted after a successful digest:
 
-The plugin directly trusts the LLM output and writes the returned files to `wiki/`. Existing wiki files with the same paths are overwritten. Each run updates `index.md`, appends `.vault-butler/log.md`, and records sync state in `.vault-butler/state.json`.
+- Markdown files outside `wiki/`
+- Markdown files outside `.vault-butler/`
+- Markdown files outside `.obsidian/`
+- Markdown files other than `AGENTS.md`
+- Markdown files other than `index.md`
 
-## Notes
+After a successful digest:
 
-This is an MVP. Good next steps:
+- generated wiki pages are written or overwritten under `wiki/`
+- `index.md` is rebuilt
+- `.vault-butler/log.md` is appended
+- source notes used for that run are deleted
 
-- support local Ollama/LM Studio models
-- add embeddings and semantic deduplication
-- add Linear/GitHub issue export
-- add content hashing in addition to modified-time based incremental sync
+If the LLM returns no files or the request fails, source notes are kept.

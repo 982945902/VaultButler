@@ -14,11 +14,10 @@ interface VaultButlerSettings {
   apiBaseUrl: string;
   apiKey: string;
   model: string;
-  rawFolder: string;
   wikiFolder: string;
   indexFile: string;
   agentsFile: string;
-  maxRawFilesPerRun: number;
+  maxSourceFilesPerRun: number;
 }
 
 interface WikiFile {
@@ -31,19 +30,15 @@ interface LlmWikiResponse {
   files?: WikiFile[];
 }
 
-interface SourceState {
-  mtime: number;
-  size: number;
-  syncedAt: string;
-  writtenFiles: string[];
-}
-
 interface VaultButlerState {
   version: number;
-  sources: Record<string, SourceState>;
+  lastRunAt?: string;
+  totalRuns: number;
+  lastWrittenFiles: string[];
 }
 
-interface RawSource {
+interface SourceNote {
+  file: TFile;
   path: string;
   content: string;
   mtime: number;
@@ -54,11 +49,10 @@ const DEFAULT_SETTINGS: VaultButlerSettings = {
   apiBaseUrl: "https://api.openai.com/v1",
   apiKey: "",
   model: "gpt-4.1-mini",
-  rawFolder: "raw",
   wikiFolder: "wiki",
   indexFile: "index.md",
   agentsFile: "AGENTS.md",
-  maxRawFilesPerRun: 20,
+  maxSourceFilesPerRun: 20,
 };
 
 const HIDDEN_FOLDER = ".vault-butler";
@@ -69,30 +63,61 @@ const AGENTS_TEMPLATE = `# Vault Butler Rules
 
 You maintain this Obsidian vault as a Markdown wiki.
 
+## Model
+
+- Source notes are temporary input material.
+- Vault Butler digests source notes into durable wiki pages.
+- After a successful digest, source notes are deleted.
+- The wiki should stand on its own; do not preserve raw/source records.
+
 ## Folders
 
-- \`raw/\` contains immutable source notes. Never edit or rewrite raw files.
 - \`wiki/\` contains synthesized wiki pages.
 - \`index.md\` is the navigation map.
 - \`.vault-butler/log.md\` is the hidden maintenance log.
-- \`.vault-butler/state.json\` tracks incremental sync state.
+- \`.vault-butler/state.json\` tracks plugin run state without storing source note content.
 
 ## Writing Rules
 
 - Write durable knowledge into focused wiki pages.
-- Preserve source references with Obsidian links when useful.
 - Prefer updating existing pages over creating duplicates.
-- Keep claims grounded in the source material.
+- Keep useful concrete details, code examples, API calls, benchmark conclusions, and workflows.
+- Do not copy secrets, tokens, API keys, or credentials into wiki pages. Replace them with placeholders such as \`<PADDLE_TOKEN>\` or \`<API_KEY>\`.
+- Do not link to deleted source notes.
+- Do not add source/path sections whose only purpose is preserving raw provenance.
 - Use concise Markdown with clear headings.
-- Each generated page should include a source section with the raw note path and latest raw update time.
 
 ## Suggested Wiki Areas
 
 - \`wiki/concepts/\`
 - \`wiki/projects/\`
 - \`wiki/workflows/\`
+- \`wiki/examples/\`
 - \`wiki/sources/\`
 - \`wiki/decisions/\`
+
+## Wiki Directory Semantics
+
+- \`wiki/workflows/\`
+  Use for repeatable procedures: how to accomplish a task. A workflow page should explain when to use the workflow, required inputs, steps, outputs, and link to concrete examples when examples exist. It should not duplicate long source code unless no separate example page is needed.
+
+- \`wiki/examples/\`
+  Use for concrete runnable examples, API calls, scripts, payloads, benchmark commands, or integration snippets extracted from source notes. Example pages should preserve enough detail to be directly useful, but replace secrets with placeholders.
+
+- \`wiki/concepts/\`
+  Use for reusable ideas, API patterns, terminology, design principles, shared constraints, and cross-cutting explanations.
+
+- \`wiki/sources/\`
+  Use sparingly, only when an external reference itself deserves a cleaned summary. Do not use it to preserve temporary source notes.
+
+- \`wiki/decisions/\`
+  Use for decisions, tradeoffs, benchmark conclusions, selected approaches, and rationale.
+
+## Linking Rules
+
+- Workflow pages should link to relevant example pages when concrete calls or scripts exist.
+- Concept pages should link to workflows and examples that use the concept.
+- Example pages should link to related workflow and concept pages.
 `;
 
 export default class VaultButlerPlugin extends Plugin {
@@ -101,14 +126,20 @@ export default class VaultButlerPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
 
-    this.addRibbonIcon("refresh-cw", "Vault Butler: Update wiki", () => {
-      void this.runSafely(() => this.updateWikiFromRawChanges());
+    this.addRibbonIcon("archive-restore", "Vault Butler: Digest notes into wiki", () => {
+      void this.runSafely(() => this.digestSourceNotesIntoWiki());
     });
 
     this.addCommand({
-      id: "update-wiki-from-raw-changes",
-      name: "Update wiki from raw changes",
-      callback: () => this.runSafely(() => this.updateWikiFromRawChanges()),
+      id: "digest-source-notes-into-wiki",
+      name: "Digest source notes into wiki",
+      callback: () => this.runSafely(() => this.digestSourceNotesIntoWiki()),
+    });
+
+    this.addCommand({
+      id: "force-update-all-source-notes",
+      name: "Force update all source notes",
+      callback: () => this.runSafely(() => this.digestSourceNotesIntoWiki()),
     });
 
     this.addCommand({
@@ -127,11 +158,16 @@ export default class VaultButlerPlugin extends Plugin {
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-    this.settings.rawFolder = cleanPath(this.settings.rawFolder);
+    const loaded = (await this.loadData()) as Partial<VaultButlerSettings> & {
+      rawFolder?: string;
+      maxRawFilesPerRun?: number;
+    };
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
     this.settings.wikiFolder = cleanPath(this.settings.wikiFolder);
     this.settings.indexFile = cleanPath(this.settings.indexFile);
     this.settings.agentsFile = cleanPath(this.settings.agentsFile);
+    this.settings.maxSourceFilesPerRun =
+      this.settings.maxSourceFilesPerRun || loaded.maxRawFilesPerRun || DEFAULT_SETTINGS.maxSourceFilesPerRun;
   }
 
   async saveSettings() {
@@ -159,27 +195,27 @@ export default class VaultButlerPlugin extends Plugin {
     new Notice(`Vault Butler wrote ${path}.`);
   }
 
-  async updateWikiFromRawChanges() {
+  async digestSourceNotesIntoWiki() {
     if (!this.settings.apiKey.trim()) {
       new Notice("Set an API key in Vault Butler settings first.");
       return;
     }
 
-    const changedSources = await this.collectChangedRawSources();
-    if (changedSources.length === 0) {
-      new Notice("Vault Butler: wiki is already up to date.");
-      await this.appendLog("No raw changes detected.");
+    const sources = await this.collectSourceNotes();
+    if (sources.length === 0) {
+      new Notice("Vault Butler: no source notes to digest.");
+      await this.appendLog("No source notes to digest.");
       return;
     }
 
-    new Notice(`Vault Butler syncing ${changedSources.length} changed raw file(s)...`, 8000);
+    new Notice(`Vault Butler digesting ${sources.length} source note(s)...`, 8000);
     const existingWiki = await this.readExistingWikiSummary();
     const agents = await this.readOptionalFile(this.settings.agentsFile);
-    const response = await this.requestWikiPlan(changedSources, existingWiki, agents);
+    const response = await this.requestWikiPlan(sources, existingWiki, agents);
 
     if (!response.files || response.files.length === 0) {
-      new Notice("The model did not return any wiki files.");
-      await this.appendLog(`No wiki files returned for ${changedSources.length} changed raw file(s).`);
+      new Notice("The model did not return any wiki files. Source notes were kept.");
+      await this.appendLog(`No wiki files returned for ${sources.length} source note(s); source notes kept.`);
       return;
     }
 
@@ -189,30 +225,23 @@ export default class VaultButlerPlugin extends Plugin {
       writtenCount += 1;
     }
 
-    await this.recordSyncedSources(changedSources, response.files);
+    await this.deleteSourceNotes(sources);
+    await this.recordRun(response.files);
     await this.rebuildIndex(false);
-    await this.appendLog(
-      `Synced ${changedSources.length} raw file(s); wrote ${writtenCount} wiki file(s). Latest raw update: ${latestMtimeIso(changedSources)}. Sources: ${changedSources.map((source) => source.path).join(", ")}`,
-    );
-    new Notice(`Vault Butler synced ${changedSources.length} raw file(s), wrote ${writtenCount} wiki file(s).`);
+    await this.appendLog(`Digested ${sources.length} source note(s); wrote ${writtenCount} wiki file(s).`);
+    new Notice(`Vault Butler digested ${sources.length} source note(s), wrote ${writtenCount} wiki file(s), and deleted the source note(s).`);
   }
 
-  async collectChangedRawSources(): Promise<RawSource[]> {
-    const rawFolder = this.app.vault.getAbstractFileByPath(this.settings.rawFolder);
-    if (!(rawFolder instanceof TFolder)) {
-      throw new Error(`Raw folder not found: ${this.settings.rawFolder}`);
-    }
+  async collectSourceNotes(): Promise<SourceNote[]> {
+    const candidates = this.app.vault
+      .getMarkdownFiles()
+      .filter((file) => this.isSourceCandidate(file.path))
+      .sort((a, b) => a.path.localeCompare(b.path))
+      .slice(0, this.settings.maxSourceFilesPerRun);
 
-    const state = await this.readState();
-    const files = this.collectMarkdownFiles(rawFolder);
-    const changed = files.filter((file) => {
-      const previous = state.sources[file.path];
-      return !previous || previous.mtime !== file.stat.mtime || previous.size !== file.stat.size;
-    });
-
-    const limited = changed.slice(0, this.settings.maxRawFilesPerRun);
     return Promise.all(
-      limited.map(async (file) => ({
+      candidates.map(async (file) => ({
+        file,
         path: file.path,
         content: await this.app.vault.read(file),
         mtime: file.stat.mtime,
@@ -221,29 +250,21 @@ export default class VaultButlerPlugin extends Plugin {
     );
   }
 
-  async recordSyncedSources(sources: RawSource[], writtenFiles: WikiFile[]) {
-    const state = await this.readState();
-    const syncedAt = new Date().toISOString();
-    const writtenPaths = writtenFiles.map((file) => cleanPath(file.path));
-
+  async deleteSourceNotes(sources: SourceNote[]) {
     for (const source of sources) {
-      state.sources[source.path] = {
-        mtime: source.mtime,
-        size: source.size,
-        syncedAt,
-        writtenFiles: writtenPaths,
-      };
+      const current = this.app.vault.getAbstractFileByPath(source.path);
+      if (current instanceof TFile) {
+        await this.app.vault.delete(current, true);
+      }
     }
-
-    await this.writeState(state);
   }
 
-  async requestWikiPlan(sources: RawSource[], existingWiki: string, agents: string): Promise<LlmWikiResponse> {
+  async requestWikiPlan(sources: SourceNote[], existingWiki: string, agents: string): Promise<LlmWikiResponse> {
     const url = `${this.settings.apiBaseUrl.replace(/\/+$/, "")}/chat/completions`;
     const sourceText = sources
       .map(
-        (source) =>
-          `SOURCE: ${source.path}\nLATEST_RAW_UPDATE: ${new Date(source.mtime).toISOString()}\nSIZE_BYTES: ${source.size}\n\n${source.content}`,
+        (source, index) =>
+          `SOURCE_NOTE_${index + 1}\nMODIFIED_AT: ${new Date(source.mtime).toISOString()}\nSIZE_BYTES: ${source.size}\n\n${source.content}`,
       )
       .join("\n\n---\n\n");
 
@@ -262,16 +283,18 @@ Existing wiki inventory:
 ${existingWiki || "(none)"}
 
 Task:
-Incrementally update the Markdown wiki from the changed raw source notes.
+Digest the source notes into the Markdown wiki.
+The source notes are temporary and will be deleted after a successful run.
+Use the wiki directory semantics from AGENTS.md to decide which pages to create or update. Do not force every directory to be used.
 
 Constraints:
 - Return JSON shaped as {"summary":"...","files":[{"path":"wiki/...md","content":"..."}]}.
 - Every file path must be inside ${this.settings.wikiFolder}/ and end in .md.
 - Return the full desired content for each file. Existing files may be overwritten.
 - Prefer updating existing related wiki pages over creating duplicates.
-- Use Obsidian links where useful.
-- Include source references and latest raw update time in each generated page.
-- Do not write index.md, AGENTS.md, hidden files, raw files, or arbitrary paths.
+- Preserve useful code examples, API payloads, workflow steps, benchmark results, conclusions, and concepts.
+- Do not include links to source notes, raw note paths, source/path sections, or provenance sections.
+- Do not write index.md, AGENTS.md, hidden files, source files, or arbitrary paths.
 
 ${sourceText}`,
       },
@@ -402,18 +425,28 @@ ${sourceText}`,
   async readState(): Promise<VaultButlerState> {
     const text = await this.readOptionalFile(STATE_FILE);
     if (!text.trim()) {
-      return { version: 1, sources: {} };
+      return { version: 2, totalRuns: 0, lastWrittenFiles: [] };
     }
 
     try {
-      const state = JSON.parse(text) as VaultButlerState;
+      const state = JSON.parse(text) as Partial<VaultButlerState>;
       return {
-        version: state.version || 1,
-        sources: state.sources || {},
+        version: 2,
+        lastRunAt: state.lastRunAt,
+        totalRuns: state.totalRuns || 0,
+        lastWrittenFiles: state.lastWrittenFiles || [],
       };
     } catch {
-      return { version: 1, sources: {} };
+      return { version: 2, totalRuns: 0, lastWrittenFiles: [] };
     }
+  }
+
+  async recordRun(writtenFiles: WikiFile[]) {
+    const state = await this.readState();
+    state.lastRunAt = new Date().toISOString();
+    state.totalRuns += 1;
+    state.lastWrittenFiles = writtenFiles.map((file) => cleanPath(file.path));
+    await this.writeState(state);
   }
 
   async writeState(state: VaultButlerState) {
@@ -452,6 +485,21 @@ ${sourceText}`,
     }
   }
 
+  isSourceCandidate(path: string): boolean {
+    const clean = cleanPath(path);
+    if (!clean.endsWith(".md")) {
+      return false;
+    }
+    if (clean === this.settings.indexFile || clean === this.settings.agentsFile) {
+      return false;
+    }
+    return !(
+      clean.startsWith(`${this.settings.wikiFolder}/`) ||
+      clean.startsWith(`${HIDDEN_FOLDER}/`) ||
+      clean.startsWith(".obsidian/")
+    );
+  }
+
   isAllowedWikiPath(path: string): boolean {
     const clean = cleanPath(path);
     const wiki = `${this.settings.wikiFolder}/`;
@@ -459,7 +507,7 @@ ${sourceText}`,
   }
 }
 
-type PathSettingKey = "rawFolder" | "wikiFolder" | "indexFile" | "agentsFile";
+type PathSettingKey = "wikiFolder" | "indexFile" | "agentsFile";
 
 class VaultButlerSettingTab extends PluginSettingTab {
   plugin: VaultButlerPlugin;
@@ -512,18 +560,17 @@ class VaultButlerSettingTab extends PluginSettingTab {
         }),
       );
 
-    this.addPathSetting("Raw folder", "Source notes. Vault Butler never writes here.", "rawFolder");
     this.addPathSetting("Wiki folder", "AI-synthesized pages are written here and may be overwritten.", "wikiFolder");
     this.addPathSetting("Index file", "Root-level Markdown navigation file.", "indexFile");
     this.addPathSetting("AGENTS file", "Root-level Markdown rules file.", "agentsFile");
 
     new Setting(containerEl)
-      .setName("Max raw files per run")
-      .setDesc("Caps the one-click update command to keep requests manageable.")
+      .setName("Max source files per run")
+      .setDesc("Caps the digest command to keep requests manageable.")
       .addText((text) =>
-        text.setValue(String(this.plugin.settings.maxRawFilesPerRun)).onChange(async (value) => {
+        text.setValue(String(this.plugin.settings.maxSourceFilesPerRun)).onChange(async (value) => {
           const parsed = Number.parseInt(value, 10);
-          this.plugin.settings.maxRawFilesPerRun = Number.isFinite(parsed) && parsed > 0 ? parsed : 20;
+          this.plugin.settings.maxSourceFilesPerRun = Number.isFinite(parsed) && parsed > 0 ? parsed : 20;
           await this.plugin.saveSettings();
         }),
       );
@@ -560,10 +607,6 @@ function titleCase(value: string): string {
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
-}
-
-function latestMtimeIso(sources: RawSource[]): string {
-  return new Date(Math.max(...sources.map((source) => source.mtime))).toISOString();
 }
 
 function errorMessage(error: unknown): string {
